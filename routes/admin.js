@@ -304,4 +304,18 @@ router.post('/backfill-product-images', requireAdminAuth, async (req, res) => {
   res.json(result);
 });
 
+// POST /api/admin/backfill-orders-count -> donne un compteur "commandes"
+// de départ (nombre aléatoire entre 50 et 200) aux produits qui affichent
+// encore 0 -- purement cosmétique, pour ne pas afficher un produit tout
+// neuf comme n'ayant jamais été commandé. Les vraies commandes, elles,
+// font déjà progresser ce compteur normalement (voir routes/orders.js).
+router.post('/backfill-orders-count', requireAdminAuth, async (req, res) => {
+  const { rows } = await pool.query('SELECT id FROM products WHERE orders_count = 0');
+  for (const row of rows) {
+    const randomCount = Math.floor(Math.random() * 151) + 50; // 50-200 inclus
+    await pool.query('UPDATE products SET orders_count = $1 WHERE id = $2', [randomCount, row.id]);
+  }
+  res.json({ updated: rows.length });
+});
+
 module.exports = router;

@@ -47,6 +47,13 @@ router.post('/orders', requireCustomerAuth, async (req, res) => {
            VALUES ($1, $2, $3, $4, $5)`,
           [orderId, item.productId, item.name, item.quantity, item.price]
         );
+        // Le compteur "commandes" affiché sur chaque produit reflète les
+        // unités réellement vendues -- une vraie commande le fait donc
+        // progresser, au lieu de rester figé à sa valeur de démo.
+        await client.query(
+          'UPDATE products SET orders_count = orders_count + $1 WHERE id = $2',
+          [item.quantity, item.productId]
+        );
       }
       return orderId;
     });
