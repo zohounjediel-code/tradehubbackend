@@ -53,6 +53,33 @@ router.get('/me', requireAdminAuth, async (req, res) => {
 });
 
 // -----------------------------------------------------------------------
+// CATÉGORIES
+// -----------------------------------------------------------------------
+
+// Crée une nouvelle catégorie de produits (admin uniquement -- les
+// catégories initiales viennent du seed, celle-ci permet d'en ajouter
+// d'autres ensuite sans toucher à la base directement).
+router.post('/categories', requireAdminAuth, async (req, res) => {
+  const { name, slug, icon } = req.body;
+
+  if (!name || !name.trim() || !slug || !slug.trim()) {
+    return res.status(400).json({ error: 'Nom et slug sont requis.' });
+  }
+
+  const normalizedSlug = slug.trim().toLowerCase();
+  const existing = await pool.query('SELECT id FROM categories WHERE slug = $1', [normalizedSlug]);
+  if (existing.rows[0]) {
+    return res.status(409).json({ error: 'Une catégorie avec ce slug existe déjà.' });
+  }
+
+  const { rows } = await pool.query(
+    'INSERT INTO categories (name, slug, icon) VALUES ($1, $2, $3) RETURNING *',
+    [name.trim(), normalizedSlug, icon || null]
+  );
+  res.status(201).json(rows[0]);
+});
+
+// -----------------------------------------------------------------------
 // GESTION DES COMPTES BOUTIQUE
 // -----------------------------------------------------------------------
 
