@@ -26,10 +26,14 @@ async function uploadBuffer(buffer, mimetype, folder) {
   return { url: result.secure_url, publicId: result.public_id };
 }
 
+// deleteImage() n'est appelée que pour des images produit (jamais pour les
+// preuves de paiement, qui ne sont jamais supprimées) -- resource_type
+// 'image' fixe, car contrairement à l'upload, l'API de suppression de
+// Cloudinary n'accepte pas 'auto'.
 async function deleteImage(publicId) {
   if (!publicId) return;
   try {
-    await cloudinary.uploader.destroy(publicId, { resource_type: 'auto' });
+    await cloudinary.uploader.destroy(publicId, { resource_type: 'image' });
   } catch (err) {
     console.warn('Impossible de supprimer le fichier sur Cloudinary :', err.message);
   }
