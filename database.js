@@ -17,11 +17,13 @@ if (!connectionString) {
   throw new Error('DATABASE_URL manquant : copie .env.example en .env et renseigne-le (voir README).');
 }
 
-// Pas de SSL nécessaire contre une base locale ; requis contre Neon/Railway.
-const isLocal = /localhost|127\.0\.0\.1/.test(connectionString);
+// Pas de SSL nécessaire en local, ni sur le réseau interne Railway
+// (postgres.railway.internal) -- requis en revanche contre Neon, accessible
+// uniquement via Internet public.
+const noSslNeeded = /localhost|127\.0\.0\.1|\.railway\.internal/.test(connectionString);
 const pool = new Pool({
   connectionString,
-  ssl: isLocal ? false : { rejectUnauthorized: false },
+  ssl: noSslNeeded ? false : { rejectUnauthorized: false },
 });
 
 // Exécute `fn(client)` dans une transaction : COMMIT si tout se passe bien,
@@ -204,12 +206,12 @@ const products = [
 
   // Maison & Jardin
   { name: 'Set de casseroles inox (lot de 8)', slug: 'casseroles-inox-lot8', description: "Fond thermodiffuseur, compatible tous feux dont induction, manches ergonomiques.", price: 18.5, moq: 30, category: 'maison-jardin', shopEmail: SHOP_EMAIL, rating: 4.6, orders: 4300, imageQuery: 'stainless steel cookware set' },
-  { name: 'Lampes solaires de jardin LED',     slug: 'lampes-solaires-jardin', description: "Étanches IP65, capteur crépusculaire automatique, lot de 20 unités.", price: 1.6, moq: 300, category: 'maison-jardin', shopEmail: SHOP_EMAIL, rating: 4.4, orders: 9800, imageQuery: 'solar pathway light outdoor' },
+  { name: 'Lampes solaires de jardin LED',     slug: 'lampes-solaires-jardin', description: "Étanches IP65, capteur crépusculaire automatique, lot de 20 unités.", price: 1.6, moq: 300, category: 'maison-jardin', shopEmail: SHOP_EMAIL, rating: 4.4, orders: 9800, imageQuery: 'solar garden light' },
   { name: 'Tapis de salon tissé main',         slug: 'tapis-salon-tisse', description: "Motifs berbères traditionnels, laine et coton, plusieurs dimensions.", price: 32, moq: 20, category: 'maison-jardin', shopEmail: SHOP_EMAIL, rating: 4.9, orders: 890, imageQuery: 'handwoven area rug' },
 
   // Emballage
   { name: 'Boîtes carton kraft personnalisables', slug: 'boites-carton-kraft', description: "Carton ondulé recyclable, impression logo possible, plusieurs formats.", price: 0.35, moq: 1000, category: 'emballage', shopEmail: SHOP_EMAIL, rating: 4.5, orders: 15600, imageQuery: 'kraft cardboard boxes' },
-  { name: 'Sachets zip refermables',           slug: 'sachets-zip', description: "Polyéthylène épais, transparents, fermeture zip, plusieurs tailles.", price: 0.04, moq: 5000, category: 'emballage', shopEmail: SHOP_EMAIL, rating: 4.3, orders: 22000, imageQuery: 'ziplock plastic bags' },
+  { name: 'Sachets zip refermables',           slug: 'sachets-zip', description: "Polyéthylène épais, transparents, fermeture zip, plusieurs tailles.", price: 0.04, moq: 5000, category: 'emballage', shopEmail: SHOP_EMAIL, rating: 4.3, orders: 22000, imageQuery: 'resealable bags' },
 
   // Beauté
   { name: 'Sérum vitamine C bio (OEM)',        slug: 'serum-vitamine-c', description: "Formule anti-oxydante, packaging personnalisable, certifié cosmétique bio.", price: 2.9, moq: 200, category: 'beaute', shopEmail: SHOP_EMAIL, rating: 4.7, orders: 6700, imageQuery: 'vitamin c serum bottle' },
@@ -301,6 +303,35 @@ async function seedAdminIfMissing() {
 }
 
 // ---------------------------------------------------------------------
+// 5. RATTRAPAGE DES IMAGES (produits déjà en base, sans photo)
+// ---------------------------------------------------------------------
+// Utile quand le seed initial a tourné SANS clé Unsplash configurée : les
+// produits de démo existent déjà, donc seedIfEmpty() ne les retouchera
+// jamais (elle ne s'exécute que sur une base vide). Réutilise les mots-clés
+// (`imageQuery`) définis plus haut pour chaque produit de démo, en les
+// associant par slug.
+async function backfillProductImages() {
+  if (!isUnsplashConfigured()) {
+    return { updated: 0, reason: 'UNSPLASH_ACCESS_KEY non configurée.' };
+  }
+
+  const queryBySlug = Object.fromEntries(products.map((p) => [p.slug, p.imageQuery]));
+
+  const { rows } = await pool.query('SELECT id, slug FROM products WHERE image_url IS NULL');
+  let updated = 0;
+  for (const row of rows) {
+    const imageQuery = queryBySlug[row.slug];
+    if (!imageQuery) continue;
+    const imageUrl = await fetchUnsplashImage(imageQuery);
+    if (imageUrl) {
+      await pool.query('UPDATE products SET image_url = $1 WHERE id = $2', [imageUrl, row.id]);
+      updated += 1;
+    }
+  }
+  return { updated };
+}
+
+// ---------------------------------------------------------------------
 // Initialisation du module
 // ---------------------------------------------------------------------
 // server.js doit `await initDatabase()` avant de démarrer le serveur.
@@ -310,4 +341,4 @@ async function initDatabase() {
   await seedAdminIfMissing();
 }
 
-module.exports = { pool, withTransaction, initDatabase };
+module.exports = { pool, withTransaction, initDatabase, backfillProductImages };

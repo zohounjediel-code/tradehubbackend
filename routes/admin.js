@@ -13,7 +13,7 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const router = express.Router();
-const { pool, withTransaction } = require('../database');
+const { pool, withTransaction, backfillProductImages } = require('../database');
 const { requireAdminAuth, signAdminToken } = require('../middleware/auth');
 const { deleteImage } = require('../utils/cloudinary');
 const { encrypt, decrypt } = require('../utils/crypto');
@@ -266,6 +266,15 @@ router.get('/orders', requireAdminAuth, async (req, res) => {
   }));
 
   res.json(ordersWithItems);
+});
+
+// POST /api/admin/backfill-product-images -> va chercher une photo Unsplash
+// pour tous les produits de démo qui n'en ont pas encore (ex. seed lancé
+// avant qu'UNSPLASH_ACCESS_KEY ne soit configurée). Sans effet sur les
+// produits déjà pourvus d'une image (upload manuel ou déjà backfillés).
+router.post('/backfill-product-images', requireAdminAuth, async (req, res) => {
+  const result = await backfillProductImages();
+  res.json(result);
 });
 
 module.exports = router;
