@@ -1,34 +1,54 @@
 // database.js
 // -----------------------------------------------------------------------
-// Ce fichier gère TOUT ce qui touche à la base de données SQLite :
-//   1. La connexion au fichier tradehub.db (créé automatiquement)
+// Ce fichier gère TOUT ce qui touche à la base de données PostgreSQL :
+//   1. La connexion (pool) via DATABASE_URL
 //   2. La création des tables si elles n'existent pas encore
 //   3. Le remplissage avec des données de démonstration (seed)
-//
-// SQLite stocke toute la base dans un seul fichier -> pas de serveur
-// de base de données à installer, parfait pour débuter !
 // -----------------------------------------------------------------------
 
 require('dotenv').config();
 
-const Database = require('better-sqlite3');
+const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
-const path = require('path');
 const { fetchUnsplashImage, isUnsplashConfigured } = require('./utils/unsplashImage');
 
-const dbPath = path.join(__dirname, 'tradehub.db');
-const db = new Database(dbPath);
+const connectionString = process.env.DATABASE_URL;
+if (!connectionString) {
+  throw new Error('DATABASE_URL manquant : copie .env.example en .env et renseigne-le (voir README).');
+}
 
-// Active les clés étrangères (désactivées par défaut dans SQLite)
-db.pragma('foreign_keys = ON');
+// Pas de SSL nécessaire contre une base locale ; requis contre Neon/Railway.
+const isLocal = /localhost|127\.0\.0\.1/.test(connectionString);
+const pool = new Pool({
+  connectionString,
+  ssl: isLocal ? false : { rejectUnauthorized: false },
+});
+
+// Exécute `fn(client)` dans une transaction : COMMIT si tout se passe bien,
+// ROLLBACK si `fn` lève une erreur. Remplace `db.transaction()` (synchrone)
+// de better-sqlite3, qui n'a pas d'équivalent direct en asynchrone avec `pg`.
+async function withTransaction(fn) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await fn(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
 
 // ---------------------------------------------------------------------
 // 1. CRÉATION DES TABLES
 // ---------------------------------------------------------------------
-function createTables() {
-  db.exec(`
+async function createTables() {
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS categories (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       name TEXT NOT NULL,
       slug TEXT NOT NULL UNIQUE,
       icon TEXT
@@ -37,123 +57,100 @@ function createTables() {
     -- Comptes administrateur : peuvent créer/gérer les comptes boutique.
     -- Complètement séparés des comptes boutique (pas d'auto-inscription).
     CREATE TABLE IF NOT EXISTS admins (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       name TEXT NOT NULL,
       email TEXT NOT NULL UNIQUE,
       password_hash TEXT NOT NULL,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+      created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
     );
 
     -- Comptes client (acheteurs) : inscription libre, contrairement aux
-    -- comptes boutique qui sont désormais créés uniquement par un admin.
+    -- comptes boutique qui sont créés uniquement par un admin.
     CREATE TABLE IF NOT EXISTS customers (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       first_name TEXT NOT NULL,
       last_name TEXT NOT NULL,
       phone TEXT,
       email TEXT NOT NULL UNIQUE,
       password_hash TEXT NOT NULL,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-
-    -- Panier lié à un compte client : persiste côté serveur, donc survive
-    -- à une déconnexion/reconnexion (contrairement à un panier "invité"
-    -- qui ne vit que dans le navigateur, en localStorage).
-    -- ON DELETE CASCADE : si le produit ou le compte est supprimé, la
-    -- ligne de panier correspondante disparaît proprement.
-    CREATE TABLE IF NOT EXISTS cart_items (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      customer_id INTEGER NOT NULL,
-      product_id INTEGER NOT NULL,
-      quantity INTEGER NOT NULL,
-      FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE,
-      FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE,
-      UNIQUE(customer_id, product_id)
+      created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
     );
 
     -- Comptes boutique : créés uniquement par un administrateur (voir
-    -- routes/admin.js). Chaque boutique peut ensuite se connecter et gérer
-    -- ses propres produits depuis l'espace vendeur.
-    -- iban_encrypted / bic_encrypted sont stockés CHIFFRÉS (voir utils/crypto.js),
-    -- jamais en clair : ce sont des données bancaires sensibles.
+    -- routes/admin.js). iban_encrypted / bic_encrypted sont chiffrés
+    -- (voir utils/crypto.js), jamais en clair.
     CREATE TABLE IF NOT EXISTS shops (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       shop_name TEXT NOT NULL,
       email TEXT NOT NULL UNIQUE,
       password_hash TEXT NOT NULL,
       country TEXT,
-      verified INTEGER DEFAULT 0,
+      verified BOOLEAN DEFAULT FALSE,
       bank_account_holder TEXT,
       iban_encrypted TEXT,
       bic_encrypted TEXT,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+      created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
     );
 
     CREATE TABLE IF NOT EXISTS products (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       name TEXT NOT NULL,
       slug TEXT NOT NULL UNIQUE,
       description TEXT,
-      price REAL NOT NULL,
+      price DOUBLE PRECISION NOT NULL,
       moq INTEGER NOT NULL DEFAULT 1,
       image_url TEXT,
-      category_id INTEGER,
-      shop_id INTEGER NOT NULL,
-      rating REAL DEFAULT 4.5,
-      orders_count INTEGER DEFAULT 0,
-      FOREIGN KEY (category_id) REFERENCES categories(id),
-      FOREIGN KEY (shop_id) REFERENCES shops(id)
+      image_public_id TEXT,
+      category_id INTEGER REFERENCES categories(id),
+      shop_id INTEGER NOT NULL REFERENCES shops(id),
+      rating DOUBLE PRECISION DEFAULT 4.5,
+      orders_count INTEGER DEFAULT 0
     );
 
-    -- customer_id : désormais toujours renseigné pour une nouvelle commande
-    -- (la commande "invité" a été retirée -- il faut être connecté). La
-    -- colonne reste nullable pour ne pas casser d'éventuelles anciennes
-    -- commandes passées avant ce changement, et ON DELETE SET NULL évite
-    -- de bloquer la suppression d'un compte client plus tard.
-    --
+    -- Panier lié à un compte client : persiste côté serveur.
+    CREATE TABLE IF NOT EXISTS cart_items (
+      id SERIAL PRIMARY KEY,
+      customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+      product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+      quantity INTEGER NOT NULL,
+      UNIQUE(customer_id, product_id)
+    );
+
     -- Paiement par virement bancaire : payment_status vaut 'pending' par
-    -- défaut (en attente), puis 'reported' une fois que le client a
-    -- indiqué avoir payé (avec sa preuve). Ce n'est PAS une confirmation
-    -- que l'argent est bien arrivé -- juste un signalement du client, à
-    -- vérifier manuellement par la boutique/l'admin.
+    -- défaut, puis 'reported' une fois que le client a signalé avoir payé.
+    -- payment_proof_url pointe vers le fichier hébergé sur Cloudinary.
     CREATE TABLE IF NOT EXISTS orders (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      customer_id INTEGER,
+      id SERIAL PRIMARY KEY,
+      customer_id INTEGER REFERENCES customers(id) ON DELETE SET NULL,
       customer_name TEXT NOT NULL,
       customer_email TEXT NOT NULL,
       customer_phone TEXT,
       shipping_address TEXT NOT NULL,
-      total REAL NOT NULL,
+      total DOUBLE PRECISION NOT NULL,
       status TEXT DEFAULT 'en attente',
       payment_status TEXT DEFAULT 'pending',
-      payment_proof_filename TEXT,
-      payment_reported_at TEXT,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE SET NULL
+      payment_proof_url TEXT,
+      payment_reported_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
     );
 
     CREATE TABLE IF NOT EXISTS order_items (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      order_id INTEGER NOT NULL,
-      product_id INTEGER,
+      id SERIAL PRIMARY KEY,
+      order_id INTEGER NOT NULL REFERENCES orders(id),
+      product_id INTEGER REFERENCES products(id) ON DELETE SET NULL,
       product_name TEXT NOT NULL,
       quantity INTEGER NOT NULL,
-      unit_price REAL NOT NULL,
-      FOREIGN KEY (order_id) REFERENCES orders(id),
-      FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE SET NULL
+      unit_price DOUBLE PRECISION NOT NULL
     );
 
-    -- Messages du formulaire de contact (voir contact.html). Comme le
-    -- projet n'a pas de service d'envoi d'email configuré, les messages
-    -- sont stockés ici pour de vrai (pas un formulaire factice) et
-    -- consultables par un admin (voir admin-messages.html).
+    -- Messages du formulaire de contact.
     CREATE TABLE IF NOT EXISTS contact_messages (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       name TEXT NOT NULL,
       email TEXT NOT NULL,
       message TEXT NOT NULL,
-      is_read INTEGER DEFAULT 0,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+      is_read BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
     );
   `);
 }
@@ -175,16 +172,14 @@ const ADMIN_EMAIL = 'bestadmin1234@gmail.com';
 const ADMIN_PASSWORD = 'Bigadmin1234';
 
 // Une seule boutique de démo : "Legros", propriétaire de tous les
-// produits ci-dessous. (Avant, il y avait 17 boutiques de démo -- passé
-// à une seule à la demande, directement dans le code de seed cette fois,
-// pour que ça survive à un `rm tradehub.db` lors d'une future mise à jour.)
+// produits ci-dessous.
 const SHOP_NAME = 'Legros';
 const SHOP_EMAIL = 'legrosdetail@gmail.com';
 const SHOP_PASSWORD = '12345678';
 const SHOP_COUNTRY = 'France';
 
 const shops = [
-  { shop_name: SHOP_NAME, email: SHOP_EMAIL, country: SHOP_COUNTRY, verified: 1 },
+  { shop_name: SHOP_NAME, email: SHOP_EMAIL, country: SHOP_COUNTRY, verified: true },
 ];
 
 // Chaque produit référence sa boutique via l'email (plus lisible qu'un index).
@@ -225,8 +220,8 @@ const products = [
 // 3. INSERTION DES DONNÉES (uniquement si la base est vide)
 // ---------------------------------------------------------------------
 async function seedIfEmpty() {
-  const count = db.prepare('SELECT COUNT(*) AS n FROM categories').get().n;
-  if (count > 0) {
+  const { rows } = await pool.query('SELECT COUNT(*) AS n FROM categories');
+  if (Number(rows[0].n) > 0) {
     console.log('La base contient déjà des données (catégories/boutiques/produits), seed ignoré.');
     return;
   }
@@ -238,70 +233,47 @@ async function seedIfEmpty() {
     console.log('  → pas de clé Unsplash configurée : les produits sans photo resteront sans image (voir .env.example).');
   }
 
-  // --- Catégories ---
-  const insertCategory = db.prepare(
-    'INSERT INTO categories (name, slug, icon) VALUES (@name, @slug, @icon)'
-  );
-  const categoryIdBySlug = {};
-  const insertManyCategories = db.transaction((rows) => {
-    for (const c of rows) {
-      const info = insertCategory.run(c);
-      categoryIdBySlug[c.slug] = info.lastInsertRowid;
+  await withTransaction(async (client) => {
+    // --- Catégories ---
+    const categoryIdBySlug = {};
+    for (const c of categories) {
+      const { rows } = await client.query(
+        'INSERT INTO categories (name, slug, icon) VALUES ($1, $2, $3) RETURNING id',
+        [c.name, c.slug, c.icon]
+      );
+      categoryIdBySlug[c.slug] = rows[0].id;
+    }
+
+    // --- Boutiques (avec mot de passe hashé) ---
+    const passwordHash = bcrypt.hashSync(SHOP_PASSWORD, 10);
+    const shopIdByEmail = {};
+    for (const s of shops) {
+      const { rows } = await client.query(
+        `INSERT INTO shops (shop_name, email, password_hash, country, verified)
+         VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+        [s.shop_name, s.email, passwordHash, s.country, s.verified]
+      );
+      shopIdByEmail[s.email] = rows[0].id;
+    }
+
+    // --- Produits ---
+    // On récupère d'abord TOUTES les images via Unsplash, une par une, AVANT
+    // d'insérer -- les appels réseau sont asynchrones. Si aucune photo n'est
+    // trouvée pour un produit, image_url reste vide.
+    for (const p of products) {
+      const imageUrl = await fetchUnsplashImage(p.imageQuery);
+      await client.query(
+        `INSERT INTO products
+           (name, slug, description, price, moq, image_url, category_id, shop_id, rating, orders_count)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+        [
+          p.name, p.slug, p.description, p.price, p.moq,
+          imageUrl || null, categoryIdBySlug[p.category], shopIdByEmail[p.shopEmail],
+          p.rating, p.orders,
+        ]
+      );
     }
   });
-  insertManyCategories(categories);
-
-  // --- Boutiques (avec mot de passe hashé) ---
-  const passwordHash = bcrypt.hashSync(SHOP_PASSWORD, 10);
-  const insertShop = db.prepare(`
-    INSERT INTO shops (shop_name, email, password_hash, country, verified)
-    VALUES (@shop_name, @email, @password_hash, @country, @verified)
-  `);
-  const shopIdByEmail = {};
-  const insertManyShops = db.transaction((rows) => {
-    for (const s of rows) {
-      const info = insertShop.run({ ...s, password_hash: passwordHash });
-      shopIdByEmail[s.email] = info.lastInsertRowid;
-    }
-  });
-  insertManyShops(shops);
-
-  // --- Produits ---
-  // On récupère d'abord TOUTES les images via Unsplash, une par une, AVANT
-  // d'insérer -- les appels réseau sont asynchrones, donc on ne peut pas
-  // les faire à l'intérieur de la transaction SQLite ci-dessous (qui, elle,
-  // doit rester synchrone). Si aucune photo n'est trouvée pour un produit,
-  // image_url reste vide : mieux vaut ne rien afficher qu'un mockup qui ne
-  // ressemble pas à une vraie photo.
-  const productsWithImages = [];
-  for (const p of products) {
-    const unsplashUrl = await fetchUnsplashImage(p.imageQuery);
-    productsWithImages.push({ ...p, image_url: unsplashUrl || null });
-  }
-
-  const insertProduct = db.prepare(`
-    INSERT INTO products
-      (name, slug, description, price, moq, image_url, category_id, shop_id, rating, orders_count)
-    VALUES
-      (@name, @slug, @description, @price, @moq, @image_url, @category_id, @shop_id, @rating, @orders_count)
-  `);
-  const insertManyProducts = db.transaction((rows) => {
-    for (const p of rows) {
-      insertProduct.run({
-        name: p.name,
-        slug: p.slug,
-        description: p.description,
-        price: p.price,
-        moq: p.moq,
-        image_url: p.image_url,
-        category_id: categoryIdBySlug[p.category],
-        shop_id: shopIdByEmail[p.shopEmail],
-        rating: p.rating,
-        orders_count: p.orders,
-      });
-    }
-  });
-  insertManyProducts(productsWithImages);
 
   console.log(`✔ ${categories.length} catégories, ${shops.length} boutiques et ${products.length} produits insérés.`);
   console.log(`ℹ Connecte-toi à l'espace vendeur avec : ${SHOP_EMAIL} / ${SHOP_PASSWORD}`);
@@ -312,24 +284,18 @@ async function seedIfEmpty() {
 // ---------------------------------------------------------------------
 // Contrairement à seedIfEmpty() ci-dessus (qui ne s'exécute que sur une
 // base totalement vide), cette vérification tourne à CHAQUE démarrage du
-// serveur. Utile si tu ajoutes ou changes les identifiants admin dans ce
-// fichier après avoir déjà lancé le projet une première fois : pas besoin
-// de supprimer toute ta base pour autant, juste de relancer `npm start`.
-function seedAdminIfMissing() {
-  const existingAdmin = db.prepare('SELECT id FROM admins WHERE email = ?').get(ADMIN_EMAIL.toLowerCase());
-  if (existingAdmin) {
+// serveur.
+async function seedAdminIfMissing() {
+  const { rows } = await pool.query('SELECT id FROM admins WHERE email = $1', [ADMIN_EMAIL.toLowerCase()]);
+  if (rows[0]) {
     console.log(`La base contient déjà un compte admin (${ADMIN_EMAIL}), seed admin ignoré.`);
     return;
   }
 
-  db.prepare(`
-    INSERT INTO admins (name, email, password_hash)
-    VALUES (@name, @email, @password_hash)
-  `).run({
-    name: 'Admin TradeHub',
-    email: ADMIN_EMAIL.toLowerCase(),
-    password_hash: bcrypt.hashSync(ADMIN_PASSWORD, 10),
-  });
+  await pool.query(
+    'INSERT INTO admins (name, email, password_hash) VALUES ($1, $2, $3)',
+    ['Admin TradeHub', ADMIN_EMAIL.toLowerCase(), bcrypt.hashSync(ADMIN_PASSWORD, 10)]
+  );
 
   console.log(`✔ Compte admin créé : ${ADMIN_EMAIL}`);
 }
@@ -337,16 +303,11 @@ function seedAdminIfMissing() {
 // ---------------------------------------------------------------------
 // Initialisation du module
 // ---------------------------------------------------------------------
-// La création des tables reste synchrone (rapide, pas de réseau).
-// Le seed, lui, est asynchrone à cause des appels à l'API Unsplash --
-// c'est pour ça qu'on exporte une fonction `initDatabase()` que
-// server.js doit `await` avant de démarrer le serveur, plutôt que de
-// tout exécuter immédiatement à l'import comme avant.
-createTables();
-
+// server.js doit `await initDatabase()` avant de démarrer le serveur.
 async function initDatabase() {
+  await createTables();
   await seedIfEmpty();
-  seedAdminIfMissing();
+  await seedAdminIfMissing();
 }
 
-module.exports = { db, initDatabase };
+module.exports = { pool, withTransaction, initDatabase };

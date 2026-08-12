@@ -8,7 +8,7 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const router = express.Router();
-const { db } = require('../database');
+const { pool } = require('../database');
 const { requireCustomerAuth, signCustomerToken } = require('../middleware/auth');
 
 function toCustomerPayload(customer) {
@@ -25,7 +25,7 @@ function toCustomerPayload(customer) {
 // -----------------------------------------------------------------------
 // INSCRIPTION
 // -----------------------------------------------------------------------
-router.post('/register', (req, res) => {
+router.post('/register', async (req, res) => {
   const { firstName, lastName, phone, email, password } = req.body;
 
   if (!firstName || !lastName || !email || !password) {
@@ -35,18 +35,19 @@ router.post('/register', (req, res) => {
     return res.status(400).json({ error: 'Le mot de passe doit contenir au moins 6 caractères.' });
   }
 
-  const existing = db.prepare('SELECT id FROM customers WHERE email = ?').get(email.toLowerCase());
-  if (existing) {
+  const existing = await pool.query('SELECT id FROM customers WHERE email = $1', [email.toLowerCase()]);
+  if (existing.rows[0]) {
     return res.status(409).json({ error: 'Un compte existe déjà avec cet email.' });
   }
 
   const passwordHash = bcrypt.hashSync(password, 10);
-  const info = db.prepare(`
-    INSERT INTO customers (first_name, last_name, phone, email, password_hash)
-    VALUES (?, ?, ?, ?, ?)
-  `).run(firstName.trim(), lastName.trim(), (phone || '').trim() || null, email.toLowerCase(), passwordHash);
+  const { rows } = await pool.query(
+    `INSERT INTO customers (first_name, last_name, phone, email, password_hash)
+     VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+    [firstName.trim(), lastName.trim(), (phone || '').trim() || null, email.toLowerCase(), passwordHash]
+  );
 
-  const customer = db.prepare('SELECT * FROM customers WHERE id = ?').get(info.lastInsertRowid);
+  const customer = rows[0];
   const token = signCustomerToken(customer);
 
   res.status(201).json({ token, customer: toCustomerPayload(customer) });
@@ -55,14 +56,15 @@ router.post('/register', (req, res) => {
 // -----------------------------------------------------------------------
 // CONNEXION
 // -----------------------------------------------------------------------
-router.post('/login', (req, res) => {
+router.post('/login', async (req, res) => {
   const { email, password } = req.body;
 
   if (!email || !password) {
     return res.status(400).json({ error: 'Email et mot de passe requis.' });
   }
 
-  const customer = db.prepare('SELECT * FROM customers WHERE email = ?').get(email.toLowerCase());
+  const { rows } = await pool.query('SELECT * FROM customers WHERE email = $1', [email.toLowerCase()]);
+  const customer = rows[0];
   if (!customer || !bcrypt.compareSync(password, customer.password_hash)) {
     return res.status(401).json({ error: 'Email ou mot de passe incorrect.' });
   }
@@ -74,31 +76,34 @@ router.post('/login', (req, res) => {
 // -----------------------------------------------------------------------
 // PROFIL DU CLIENT CONNECTÉ
 // -----------------------------------------------------------------------
-router.get('/me', requireCustomerAuth, (req, res) => {
-  const customer = db.prepare('SELECT * FROM customers WHERE id = ?').get(req.customer.id);
-  if (!customer) return res.status(404).json({ error: 'Compte introuvable.' });
-  res.json(toCustomerPayload(customer));
+router.get('/me', requireCustomerAuth, async (req, res) => {
+  const { rows } = await pool.query('SELECT * FROM customers WHERE id = $1', [req.customer.id]);
+  if (!rows[0]) return res.status(404).json({ error: 'Compte introuvable.' });
+  res.json(toCustomerPayload(rows[0]));
 });
 
 // Modifier prénom / nom / téléphone (l'email n'est pas modifiable ici,
 // c'est l'identifiant de connexion)
-router.put('/me', requireCustomerAuth, (req, res) => {
+router.put('/me', requireCustomerAuth, async (req, res) => {
   const { firstName, lastName, phone } = req.body;
   if (!firstName || !firstName.trim() || !lastName || !lastName.trim()) {
     return res.status(400).json({ error: 'Prénom et nom sont requis.' });
   }
 
-  db.prepare('UPDATE customers SET first_name = ?, last_name = ?, phone = ? WHERE id = ?')
-    .run(firstName.trim(), lastName.trim(), (phone || '').trim() || null, req.customer.id);
+  await pool.query(
+    'UPDATE customers SET first_name = $1, last_name = $2, phone = $3 WHERE id = $4',
+    [firstName.trim(), lastName.trim(), (phone || '').trim() || null, req.customer.id]
+  );
 
-  const updated = db.prepare('SELECT * FROM customers WHERE id = ?').get(req.customer.id);
+  const { rows } = await pool.query('SELECT * FROM customers WHERE id = $1', [req.customer.id]);
+  const updated = rows[0];
   const token = signCustomerToken(updated);
 
   res.json({ token, customer: toCustomerPayload(updated) });
 });
 
 // Modifier le mot de passe (demande l'ancien, par sécurité)
-router.put('/me/password', requireCustomerAuth, (req, res) => {
+router.put('/me/password', requireCustomerAuth, async (req, res) => {
   const { currentPassword, newPassword } = req.body;
 
   if (!currentPassword || !newPassword) {
@@ -108,7 +113,8 @@ router.put('/me/password', requireCustomerAuth, (req, res) => {
     return res.status(400).json({ error: 'Le nouveau mot de passe doit contenir au moins 6 caractères.' });
   }
 
-  const customer = db.prepare('SELECT * FROM customers WHERE id = ?').get(req.customer.id);
+  const { rows } = await pool.query('SELECT * FROM customers WHERE id = $1', [req.customer.id]);
+  const customer = rows[0];
   if (!customer || !bcrypt.compareSync(currentPassword, customer.password_hash)) {
     return res.status(400).json({ error: 'Ancien mot de passe incorrect !' });
   }
@@ -117,7 +123,7 @@ router.put('/me/password', requireCustomerAuth, (req, res) => {
   }
 
   const newHash = bcrypt.hashSync(newPassword, 10);
-  db.prepare('UPDATE customers SET password_hash = ? WHERE id = ?').run(newHash, customer.id);
+  await pool.query('UPDATE customers SET password_hash = $1 WHERE id = $2', [newHash, customer.id]);
 
   res.json({ success: true });
 });

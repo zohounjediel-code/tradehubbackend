@@ -13,23 +13,24 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const router = express.Router();
-const { db } = require('../database');
+const { pool, withTransaction } = require('../database');
 const { requireAdminAuth, signAdminToken } = require('../middleware/auth');
-const { deleteUploadedImage } = require('../middleware/upload');
+const { deleteImage } = require('../utils/cloudinary');
 const { encrypt, decrypt } = require('../utils/crypto');
 const { isValidIBAN, isValidBIC } = require('../utils/validators');
 
 // -----------------------------------------------------------------------
 // CONNEXION ADMIN
 // -----------------------------------------------------------------------
-router.post('/login', (req, res) => {
+router.post('/login', async (req, res) => {
   const { email, password } = req.body;
 
   if (!email || !password) {
     return res.status(400).json({ error: 'Email et mot de passe requis.' });
   }
 
-  const admin = db.prepare('SELECT * FROM admins WHERE email = ?').get(email.toLowerCase());
+  const { rows } = await pool.query('SELECT * FROM admins WHERE email = $1', [email.toLowerCase()]);
+  const admin = rows[0];
   if (!admin || !bcrypt.compareSync(password, admin.password_hash)) {
     return res.status(401).json({ error: 'Email ou mot de passe incorrect.' });
   }
@@ -42,10 +43,13 @@ router.post('/login', (req, res) => {
 });
 
 // Profil de l'admin connecté
-router.get('/me', requireAdminAuth, (req, res) => {
-  const admin = db.prepare('SELECT id, name, email, created_at FROM admins WHERE id = ?').get(req.admin.id);
-  if (!admin) return res.status(404).json({ error: 'Administrateur introuvable.' });
-  res.json(admin);
+router.get('/me', requireAdminAuth, async (req, res) => {
+  const { rows } = await pool.query(
+    'SELECT id, name, email, created_at FROM admins WHERE id = $1',
+    [req.admin.id]
+  );
+  if (!rows[0]) return res.status(404).json({ error: 'Administrateur introuvable.' });
+  res.json(rows[0]);
 });
 
 // -----------------------------------------------------------------------
@@ -53,30 +57,34 @@ router.get('/me', requireAdminAuth, (req, res) => {
 // -----------------------------------------------------------------------
 
 // Liste de toutes les boutiques, avec leur nombre de produits
-router.get('/shops', requireAdminAuth, (req, res) => {
-  const shops = db.prepare(`
+router.get('/shops', requireAdminAuth, async (req, res) => {
+  const { rows } = await pool.query(`
     SELECT s.id, s.shop_name, s.email, s.country, s.verified, s.created_at,
            COUNT(p.id) AS product_count
     FROM shops s
     LEFT JOIN products p ON p.shop_id = s.id
     GROUP BY s.id
     ORDER BY s.created_at DESC
-  `).all();
-  res.json(shops);
+  `);
+  res.json(rows);
 });
 
 // Détail complet d'une boutique (toutes ses infos + ses produits) --
 // c'est la route utilisée par le bouton "Voir" et par le formulaire "Modifier".
-router.get('/shops/:id', requireAdminAuth, (req, res) => {
-  const shop = db.prepare(`
+router.get('/shops/:id', requireAdminAuth, async (req, res) => {
+  const { rows } = await pool.query(`
     SELECT id, shop_name, email, country, verified, bank_account_holder,
            iban_encrypted, bic_encrypted, created_at
-    FROM shops WHERE id = ?
-  `).get(req.params.id);
+    FROM shops WHERE id = $1
+  `, [req.params.id]);
+  const shop = rows[0];
 
   if (!shop) return res.status(404).json({ error: 'Boutique introuvable.' });
 
-  const products = db.prepare('SELECT id, name, price, image_url FROM products WHERE shop_id = ?').all(shop.id);
+  const products = await pool.query(
+    'SELECT id, name, price, image_url FROM products WHERE shop_id = $1',
+    [shop.id]
+  );
 
   res.json({
     id: shop.id,
@@ -89,12 +97,12 @@ router.get('/shops/:id', requireAdminAuth, (req, res) => {
     // Déchiffrés uniquement ici, pour un admin authentifié
     iban: decrypt(shop.iban_encrypted) || '',
     bic: decrypt(shop.bic_encrypted) || '',
-    products,
+    products: products.rows,
   });
 });
 
 // Créer un nouveau compte boutique (l'admin onboarde un fournisseur)
-router.post('/shops', requireAdminAuth, (req, res) => {
+router.post('/shops', requireAdminAuth, async (req, res) => {
   const { shopName, email, password, country, verified } = req.body;
 
   if (!shopName || !email || !password) {
@@ -104,26 +112,27 @@ router.post('/shops', requireAdminAuth, (req, res) => {
     return res.status(400).json({ error: 'Le mot de passe doit contenir au moins 6 caractères.' });
   }
 
-  const existing = db.prepare('SELECT id FROM shops WHERE email = ?').get(email.toLowerCase());
-  if (existing) {
+  const existing = await pool.query('SELECT id FROM shops WHERE email = $1', [email.toLowerCase()]);
+  if (existing.rows[0]) {
     return res.status(409).json({ error: 'Un compte existe déjà avec cet email.' });
   }
 
   const passwordHash = bcrypt.hashSync(password, 10);
-  const info = db.prepare(`
-    INSERT INTO shops (shop_name, email, password_hash, country, verified)
-    VALUES (?, ?, ?, ?, ?)
-  `).run(shopName, email.toLowerCase(), passwordHash, country || null, verified ? 1 : 0);
+  const { rows } = await pool.query(
+    `INSERT INTO shops (shop_name, email, password_hash, country, verified)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING id, shop_name, email, country, verified, created_at`,
+    [shopName, email.toLowerCase(), passwordHash, country || null, !!verified]
+  );
 
-  const shop = db.prepare('SELECT id, shop_name, email, country, verified, created_at FROM shops WHERE id = ?')
-    .get(info.lastInsertRowid);
-  res.status(201).json(shop);
+  res.status(201).json(rows[0]);
 });
 
 // Modifier une boutique : TOUTES ses informations (identité, statut,
 // coordonnées bancaires, mot de passe optionnel)
-router.put('/shops/:id', requireAdminAuth, (req, res) => {
-  const shop = db.prepare('SELECT * FROM shops WHERE id = ?').get(req.params.id);
+router.put('/shops/:id', requireAdminAuth, async (req, res) => {
+  const { rows } = await pool.query('SELECT * FROM shops WHERE id = $1', [req.params.id]);
+  const shop = rows[0];
   if (!shop) return res.status(404).json({ error: 'Boutique introuvable.' });
 
   const { shopName, email, country, verified, newPassword, bankAccountHolder, iban, bic } = req.body;
@@ -140,8 +149,11 @@ router.put('/shops/:id', requireAdminAuth, (req, res) => {
       return res.status(400).json({ error: "L'email n'est pas valide." });
     }
     if (normalizedEmail !== shop.email) {
-      const emailTaken = db.prepare('SELECT id FROM shops WHERE email = ? AND id != ?').get(normalizedEmail, shop.id);
-      if (emailTaken) {
+      const emailTaken = await pool.query(
+        'SELECT id FROM shops WHERE email = $1 AND id != $2',
+        [normalizedEmail, shop.id]
+      );
+      if (emailTaken.rows[0]) {
         return res.status(409).json({ error: 'Un autre compte utilise déjà cet email.' });
       }
     }
@@ -191,50 +203,50 @@ router.put('/shops/:id', requireAdminAuth, (req, res) => {
     bankHolder = bankAccountHolder ? bankAccountHolder.trim() : null;
   }
 
-  db.prepare(`
-    UPDATE shops SET
-      shop_name = @shop_name,
-      email = @email,
-      country = @country,
-      verified = @verified,
-      password_hash = @password_hash,
-      bank_account_holder = @bank_account_holder,
-      iban_encrypted = @iban_encrypted,
-      bic_encrypted = @bic_encrypted
-    WHERE id = @id
-  `).run({
-    id: shop.id,
-    shop_name: shopName.trim(),
-    email: normalizedEmail,
-    country: country ? country.trim() : null,
-    verified: verified ? 1 : 0,
-    password_hash: passwordHash,
-    bank_account_holder: bankHolder,
-    iban_encrypted: ibanEncrypted,
-    bic_encrypted: bicEncrypted,
-  });
+  await pool.query(
+    `UPDATE shops SET
+      shop_name = $1,
+      email = $2,
+      country = $3,
+      verified = $4,
+      password_hash = $5,
+      bank_account_holder = $6,
+      iban_encrypted = $7,
+      bic_encrypted = $8
+    WHERE id = $9`,
+    [
+      shopName.trim(), normalizedEmail, country ? country.trim() : null, !!verified,
+      passwordHash, bankHolder, ibanEncrypted, bicEncrypted, shop.id,
+    ]
+  );
 
-  const updated = db.prepare('SELECT id, shop_name, email, country, verified, created_at FROM shops WHERE id = ?')
-    .get(shop.id);
-  res.json(updated);
+  const updated = await pool.query(
+    'SELECT id, shop_name, email, country, verified, created_at FROM shops WHERE id = $1',
+    [shop.id]
+  );
+  res.json(updated.rows[0]);
 });
 
-// Supprimer une boutique ET tous ses produits (+ leurs images uploadées)
-router.delete('/shops/:id', requireAdminAuth, (req, res) => {
-  const shop = db.prepare('SELECT * FROM shops WHERE id = ?').get(req.params.id);
+// Supprimer une boutique ET tous ses produits (+ leurs images Cloudinary)
+router.delete('/shops/:id', requireAdminAuth, async (req, res) => {
+  const { rows } = await pool.query('SELECT * FROM shops WHERE id = $1', [req.params.id]);
+  const shop = rows[0];
   if (!shop) return res.status(404).json({ error: 'Boutique introuvable.' });
 
-  const deleteShopAndProducts = db.transaction(() => {
-    const products = db.prepare('SELECT id, image_url FROM products WHERE shop_id = ?').all(shop.id);
-
-    for (const product of products) {
-      deleteUploadedImage(product.image_url);
-    }
-    db.prepare('DELETE FROM products WHERE shop_id = ?').run(shop.id);
-    db.prepare('DELETE FROM shops WHERE id = ?').run(shop.id);
+  const products = await withTransaction(async (client) => {
+    const { rows: products } = await client.query(
+      'SELECT id, image_public_id FROM products WHERE shop_id = $1',
+      [shop.id]
+    );
+    await client.query('DELETE FROM products WHERE shop_id = $1', [shop.id]);
+    await client.query('DELETE FROM shops WHERE id = $1', [shop.id]);
+    return products;
   });
 
-  deleteShopAndProducts();
+  for (const product of products) {
+    await deleteImage(product.image_public_id);
+  }
+
   res.json({ success: true });
 });
 
@@ -244,13 +256,13 @@ router.delete('/shops/:id', requireAdminAuth, (req, res) => {
 
 // Liste de TOUTES les commandes, avec leurs articles -- vue d'ensemble
 // admin, notamment pour suivre les paiements signalés par les clients.
-router.get('/orders', requireAdminAuth, (req, res) => {
-  const orders = db.prepare('SELECT * FROM orders ORDER BY created_at DESC').all();
-  const itemsStmt = db.prepare('SELECT * FROM order_items WHERE order_id = ?');
+router.get('/orders', requireAdminAuth, async (req, res) => {
+  const { rows: orders } = await pool.query('SELECT * FROM orders ORDER BY created_at DESC');
+  const { rows: items } = await pool.query('SELECT * FROM order_items');
 
   const ordersWithItems = orders.map((order) => ({
     ...order,
-    items: itemsStmt.all(order.id),
+    items: items.filter((it) => it.order_id === order.id),
   }));
 
   res.json(ordersWithItems);

@@ -9,9 +9,10 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const router = express.Router();
-const { db } = require('../database');
+const { pool } = require('../database');
 const { requireShopAuth, signShopToken } = require('../middleware/auth');
-const { upload, deleteUploadedImage } = require('../middleware/upload');
+const { upload } = require('../middleware/upload');
+const { uploadBuffer, deleteImage } = require('../utils/cloudinary');
 const { encrypt, decrypt } = require('../utils/crypto');
 const { isValidIBAN, isValidBIC } = require('../utils/validators');
 const { fetchUnsplashImage } = require('../utils/unsplashImage');
@@ -41,14 +42,15 @@ function slugify(text) {
 // -----------------------------------------------------------------------
 // CONNEXION
 // -----------------------------------------------------------------------
-router.post('/login', (req, res) => {
+router.post('/login', async (req, res) => {
   const { email, password } = req.body;
 
   if (!email || !password) {
     return res.status(400).json({ error: 'Email et mot de passe requis.' });
   }
 
-  const shop = db.prepare('SELECT * FROM shops WHERE email = ?').get(email.toLowerCase());
+  const { rows } = await pool.query('SELECT * FROM shops WHERE email = $1', [email.toLowerCase()]);
+  const shop = rows[0];
   if (!shop || !bcrypt.compareSync(password, shop.password_hash)) {
     return res.status(401).json({ error: 'Email ou mot de passe incorrect.' });
   }
@@ -63,12 +65,13 @@ router.post('/login', (req, res) => {
 // -----------------------------------------------------------------------
 // PROFIL DE LA BOUTIQUE CONNECTÉE
 // -----------------------------------------------------------------------
-router.get('/me', requireShopAuth, (req, res) => {
-  const shop = db.prepare(`
+router.get('/me', requireShopAuth, async (req, res) => {
+  const { rows } = await pool.query(`
     SELECT id, shop_name, email, country, verified, bank_account_holder,
            iban_encrypted, bic_encrypted, created_at
-    FROM shops WHERE id = ?
-  `).get(req.shop.id);
+    FROM shops WHERE id = $1
+  `, [req.shop.id]);
+  const shop = rows[0];
 
   if (!shop) return res.status(404).json({ error: 'Boutique introuvable.' });
 
@@ -87,7 +90,7 @@ router.get('/me', requireShopAuth, (req, res) => {
 });
 
 // Modifier le profil de la boutique connectée (infos générales + RIB)
-router.put('/me', requireShopAuth, (req, res) => {
+router.put('/me', requireShopAuth, async (req, res) => {
   const { shopName, country, bankAccountHolder, iban, bic } = req.body;
 
   if (!shopName || !shopName.trim()) {
@@ -120,24 +123,23 @@ router.put('/me', requireShopAuth, (req, res) => {
     return res.status(400).json({ error: 'Indique le titulaire du compte bancaire.' });
   }
 
-  db.prepare(`
-    UPDATE shops SET
-      shop_name = @shop_name,
-      country = @country,
-      bank_account_holder = @bank_account_holder,
-      iban_encrypted = @iban_encrypted,
-      bic_encrypted = @bic_encrypted
-    WHERE id = @id
-  `).run({
-    id: req.shop.id,
-    shop_name: shopName.trim(),
-    country: country ? country.trim() : null,
-    bank_account_holder: bankAccountHolder ? bankAccountHolder.trim() : null,
-    iban_encrypted: ibanEncrypted,
-    bic_encrypted: bicEncrypted,
-  });
+  await pool.query(
+    `UPDATE shops SET
+      shop_name = $1,
+      country = $2,
+      bank_account_holder = $3,
+      iban_encrypted = $4,
+      bic_encrypted = $5
+    WHERE id = $6`,
+    [
+      shopName.trim(), country ? country.trim() : null,
+      bankAccountHolder ? bankAccountHolder.trim() : null,
+      ibanEncrypted, bicEncrypted, req.shop.id,
+    ]
+  );
 
-  const updatedShop = db.prepare('SELECT * FROM shops WHERE id = ?').get(req.shop.id);
+  const { rows } = await pool.query('SELECT * FROM shops WHERE id = $1', [req.shop.id]);
+  const updatedShop = rows[0];
 
   // Le token contient le nom de la boutique : s'il vient de changer, on en
   // renvoie un nouveau pour que le frontend garde une session à jour.
@@ -155,7 +157,7 @@ router.put('/me', requireShopAuth, (req, res) => {
 });
 
 // Modifier le mot de passe (demande l'ancien, par sécurité)
-router.put('/me/password', requireShopAuth, (req, res) => {
+router.put('/me/password', requireShopAuth, async (req, res) => {
   const { currentPassword, newPassword } = req.body;
 
   if (!currentPassword || !newPassword) {
@@ -165,7 +167,8 @@ router.put('/me/password', requireShopAuth, (req, res) => {
     return res.status(400).json({ error: 'Le nouveau mot de passe doit contenir au moins 6 caractères.' });
   }
 
-  const shop = db.prepare('SELECT * FROM shops WHERE id = ?').get(req.shop.id);
+  const { rows } = await pool.query('SELECT * FROM shops WHERE id = $1', [req.shop.id]);
+  const shop = rows[0];
   if (!shop || !bcrypt.compareSync(currentPassword, shop.password_hash)) {
     return res.status(400).json({ error: 'Ancien mot de passe incorrect !' });
   }
@@ -174,7 +177,7 @@ router.put('/me/password', requireShopAuth, (req, res) => {
   }
 
   const newHash = bcrypt.hashSync(newPassword, 10);
-  db.prepare('UPDATE shops SET password_hash = ? WHERE id = ?').run(newHash, shop.id);
+  await pool.query('UPDATE shops SET password_hash = $1 WHERE id = $2', [newHash, shop.id]);
 
   res.json({ success: true });
 });
@@ -184,15 +187,15 @@ router.put('/me/password', requireShopAuth, (req, res) => {
 // -----------------------------------------------------------------------
 
 // Liste des produits de MA boutique
-router.get('/me/products', requireShopAuth, (req, res) => {
-  const products = db.prepare(`
+router.get('/me/products', requireShopAuth, async (req, res) => {
+  const { rows } = await pool.query(`
     SELECT p.*, c.name AS category_name
     FROM products p
     LEFT JOIN categories c ON c.id = p.category_id
-    WHERE p.shop_id = ?
+    WHERE p.shop_id = $1
     ORDER BY p.id DESC
-  `).all(req.shop.id);
-  res.json(products);
+  `, [req.shop.id]);
+  res.json(rows);
 });
 
 // Ajouter un nouveau produit (avec upload d'image optionnel, champ "image")
@@ -208,34 +211,37 @@ router.post('/me/products', requireShopAuth, upload.single('image'), async (req,
 
   const slug = slugify(name);
 
-  // Ordre de priorité pour l'image : fichier uploadé > photo Unsplash
-  // trouvée avec le nom du produit comme mot-clé > rien du tout (mieux
-  // vaut aucune image qu'un mockup qui ne ressemble pas à une vraie photo).
-  const imageUrl = req.file
-    ? `/images/products/${req.file.filename}`
-    : await fetchUnsplashImage(name);
+  // Ordre de priorité pour l'image : fichier uploadé (-> Cloudinary) > photo
+  // Unsplash trouvée avec le nom du produit comme mot-clé > rien du tout
+  // (mieux vaut aucune image qu'un mockup qui ne ressemble pas à une vraie photo).
+  let imageUrl = null;
+  let imagePublicId = null;
+  if (req.file) {
+    const uploaded = await uploadBuffer(req.file.buffer, req.file.mimetype, 'tradehub/products');
+    imageUrl = uploaded.url;
+    imagePublicId = uploaded.publicId;
+  } else {
+    imageUrl = await fetchUnsplashImage(name);
+  }
 
-  const info = db.prepare(`
-    INSERT INTO products (name, slug, description, price, moq, image_url, category_id, shop_id, rating, orders_count)
-    VALUES (@name, @slug, @description, @price, @moq, @image_url, @category_id, @shop_id, 5, 0)
-  `).run({
-    name,
-    slug,
-    description: description || '',
-    price: Number(price),
-    moq: Number(moq) > 0 ? Number(moq) : 1,
-    image_url: imageUrl,
-    category_id: Number(categoryId),
-    shop_id: req.shop.id,
-  });
+  const { rows } = await pool.query(
+    `INSERT INTO products
+       (name, slug, description, price, moq, image_url, image_public_id, category_id, shop_id, rating, orders_count)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 5, 0)
+     RETURNING *`,
+    [
+      name, slug, description || '', Number(price), Number(moq) > 0 ? Number(moq) : 1,
+      imageUrl, imagePublicId, Number(categoryId), req.shop.id,
+    ]
+  );
 
-  const product = db.prepare('SELECT * FROM products WHERE id = ?').get(info.lastInsertRowid);
-  res.status(201).json(product);
+  res.status(201).json(rows[0]);
 });
 
 // Modifier un produit qui M'APPARTIENT (nouvelle image optionnelle)
-router.put('/me/products/:id', requireShopAuth, upload.single('image'), (req, res) => {
-  const product = db.prepare('SELECT * FROM products WHERE id = ?').get(req.params.id);
+router.put('/me/products/:id', requireShopAuth, upload.single('image'), async (req, res) => {
+  const { rows } = await pool.query('SELECT * FROM products WHERE id = $1', [req.params.id]);
+  const product = rows[0];
   if (!product) return res.status(404).json({ error: 'Produit introuvable.' });
   if (product.shop_id !== req.shop.id) {
     return res.status(403).json({ error: "Ce produit n'appartient pas à ta boutique." });
@@ -244,46 +250,53 @@ router.put('/me/products/:id', requireShopAuth, upload.single('image'), (req, re
   const { name, description, price, moq, categoryId } = req.body;
 
   // Si une nouvelle image est envoyée, elle remplace l'ancienne
-  // (et l'ancien fichier est supprimé du disque pour ne pas s'accumuler).
+  // (et l'ancien fichier est supprimé de Cloudinary pour ne pas s'accumuler).
   let imageUrl = product.image_url;
+  let imagePublicId = product.image_public_id;
   if (req.file) {
-    deleteUploadedImage(product.image_url);
-    imageUrl = `/images/products/${req.file.filename}`;
+    const uploaded = await uploadBuffer(req.file.buffer, req.file.mimetype, 'tradehub/products');
+    await deleteImage(product.image_public_id);
+    imageUrl = uploaded.url;
+    imagePublicId = uploaded.publicId;
   }
 
-  db.prepare(`
-    UPDATE products SET
-      name = @name,
-      description = @description,
-      price = @price,
-      moq = @moq,
-      image_url = @image_url,
-      category_id = @category_id
-    WHERE id = @id
-  `).run({
-    id: product.id,
-    name: name || product.name,
-    description: description ?? product.description,
-    price: Number(price) > 0 ? Number(price) : product.price,
-    moq: Number(moq) > 0 ? Number(moq) : product.moq,
-    image_url: imageUrl,
-    category_id: Number(categoryId) || product.category_id,
-  });
+  const { rows: updatedRows } = await pool.query(
+    `UPDATE products SET
+      name = $1,
+      description = $2,
+      price = $3,
+      moq = $4,
+      image_url = $5,
+      image_public_id = $6,
+      category_id = $7
+    WHERE id = $8
+    RETURNING *`,
+    [
+      name || product.name,
+      description ?? product.description,
+      Number(price) > 0 ? Number(price) : product.price,
+      Number(moq) > 0 ? Number(moq) : product.moq,
+      imageUrl,
+      imagePublicId,
+      Number(categoryId) || product.category_id,
+      product.id,
+    ]
+  );
 
-  const updated = db.prepare('SELECT * FROM products WHERE id = ?').get(product.id);
-  res.json(updated);
+  res.json(updatedRows[0]);
 });
 
 // Supprimer un produit qui M'APPARTIENT
-router.delete('/me/products/:id', requireShopAuth, (req, res) => {
-  const product = db.prepare('SELECT * FROM products WHERE id = ?').get(req.params.id);
+router.delete('/me/products/:id', requireShopAuth, async (req, res) => {
+  const { rows } = await pool.query('SELECT * FROM products WHERE id = $1', [req.params.id]);
+  const product = rows[0];
   if (!product) return res.status(404).json({ error: 'Produit introuvable.' });
   if (product.shop_id !== req.shop.id) {
     return res.status(403).json({ error: "Ce produit n'appartient pas à ta boutique." });
   }
 
-  db.prepare('DELETE FROM products WHERE id = ?').run(product.id);
-  deleteUploadedImage(product.image_url);
+  await pool.query('DELETE FROM products WHERE id = $1', [product.id]);
+  await deleteImage(product.image_public_id);
   res.json({ success: true });
 });
 
@@ -294,24 +307,24 @@ router.delete('/me/products/:id', requireShopAuth, (req, res) => {
 // Liste des commandes contenant au moins un produit de MA boutique, avec
 // le sous-total qui me revient sur chacune -- pour suivre les paiements
 // signalés par les clients (virement bancaire).
-router.get('/me/orders', requireShopAuth, (req, res) => {
-  const orders = db.prepare(`
+router.get('/me/orders', requireShopAuth, async (req, res) => {
+  const { rows: orders } = await pool.query(`
     SELECT DISTINCT o.*
     FROM orders o
     JOIN order_items oi ON oi.order_id = o.id
     JOIN products p ON p.id = oi.product_id
-    WHERE p.shop_id = ?
+    WHERE p.shop_id = $1
     ORDER BY o.created_at DESC
-  `).all(req.shop.id);
+  `, [req.shop.id]);
 
-  const itemsStmt = db.prepare(`
+  const { rows: allItems } = await pool.query(`
     SELECT oi.* FROM order_items oi
     JOIN products p ON p.id = oi.product_id
-    WHERE oi.order_id = ? AND p.shop_id = ?
-  `);
+    WHERE p.shop_id = $1
+  `, [req.shop.id]);
 
   const ordersWithItems = orders.map((order) => {
-    const items = itemsStmt.all(order.id, req.shop.id);
+    const items = allItems.filter((it) => it.order_id === order.id);
     return {
       ...order,
       items,

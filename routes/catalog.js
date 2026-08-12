@@ -8,7 +8,7 @@
 
 const express = require('express');
 const router = express.Router();
-const { db } = require('../database');
+const { pool } = require('../database');
 
 const PRODUCT_SELECT = `
   SELECT
@@ -21,50 +21,50 @@ const PRODUCT_SELECT = `
 `;
 
 // GET /api/categories -> liste toutes les catégories
-router.get('/categories', (req, res) => {
-  const categories = db.prepare('SELECT * FROM categories ORDER BY name').all();
-  res.json(categories);
+router.get('/categories', async (req, res) => {
+  const { rows } = await pool.query('SELECT * FROM categories ORDER BY name');
+  res.json(rows);
 });
 
 // GET /api/products -> liste les produits
 // Paramètres optionnels : ?category=slug  &  ?search=terme
-router.get('/products', (req, res) => {
+router.get('/products', async (req, res) => {
   const { category, search } = req.query;
 
   let query = `${PRODUCT_SELECT} WHERE 1=1`;
-  const params = {};
+  const params = [];
 
   if (category) {
-    query += ' AND c.slug = @category';
-    params.category = category;
+    params.push(category);
+    query += ` AND c.slug = $${params.length}`;
   }
   if (search) {
-    query += ' AND (p.name LIKE @search OR p.description LIKE @search)';
-    params.search = `%${search}%`;
+    params.push(`%${search}%`);
+    query += ` AND (p.name ILIKE $${params.length} OR p.description ILIKE $${params.length})`;
   }
 
   query += ' ORDER BY p.id DESC';
 
-  const products = db.prepare(query).all(params);
-  res.json(products);
+  const { rows } = await pool.query(query, params);
+  res.json(rows);
 });
 
 // GET /api/products/:slug -> détail d'un produit
-router.get('/products/:slug', (req, res) => {
-  const product = db.prepare(`${PRODUCT_SELECT} WHERE p.slug = ?`).get(req.params.slug);
+router.get('/products/:slug', async (req, res) => {
+  const { rows } = await pool.query(`${PRODUCT_SELECT} WHERE p.slug = $1`, [req.params.slug]);
+  const product = rows[0];
 
   if (!product) {
     return res.status(404).json({ error: 'Produit introuvable' });
   }
 
   // Produits similaires (même catégorie, hors produit courant)
-  const related = db.prepare(`
-    SELECT * FROM products
-    WHERE category_id = ? AND id != ?
-    LIMIT 4
-  `).all(product.category_id, product.id);
+  const related = await pool.query(
+    'SELECT * FROM products WHERE category_id = $1 AND id != $2 LIMIT 4',
+    [product.category_id, product.id]
+  );
 
-  res.json({ ...product, related });
+  res.json({ ...product, related: related.rows });
 });
 
 module.exports = router;
