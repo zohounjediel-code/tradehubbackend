@@ -11,6 +11,7 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../database');
 const { requireAdminAuth } = require('../middleware/auth');
+const { sendContactNotificationEmail } = require('../utils/email');
 
 // POST /api/contact -> envoyer un message (public, pas besoin de compte)
 router.post('/', async (req, res) => {
@@ -24,6 +25,8 @@ router.post('/', async (req, res) => {
     'INSERT INTO contact_messages (name, email, message) VALUES ($1, $2, $3)',
     [name.trim(), email.trim(), message.trim()]
   );
+
+  sendContactNotificationEmail({ name: name.trim(), email: email.trim(), message: message.trim() });
 
   res.status(201).json({ success: true });
 });

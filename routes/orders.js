@@ -16,6 +16,7 @@ const { requireCustomerAuth, verifyAnyToken } = require('../middleware/auth');
 const { uploadPaymentProof } = require('../middleware/upload');
 const { uploadBuffer } = require('../utils/cloudinary');
 const { decrypt } = require('../utils/crypto');
+const { sendOrderConfirmationEmail, sendShopNewOrderEmail } = require('../utils/email');
 
 // POST /api/orders -> crée une nouvelle commande (client connecté requis)
 // Corps attendu : { phone, address, items: [ { productId, name, price, quantity }, ... ] }
@@ -58,10 +59,50 @@ router.post('/orders', requireCustomerAuth, async (req, res) => {
       return orderId;
     });
 
+    sendOrderEmails(orderId, { items, total, address: address.trim() }); // en tâche de fond
+
     res.status(201).json({ orderId, total });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Erreur lors de l'enregistrement de la commande." });
+  }
+
+  // Confirmation au client + notification à chaque boutique concernée
+  // (une commande peut mélanger des produits de plusieurs boutiques).
+  async function sendOrderEmails(orderId, { items, total, address }) {
+    sendOrderConfirmationEmail({
+      customer: { name: req.customer.name, email: req.customer.email },
+      orderId,
+      items: items.map((it) => ({ product_name: it.name, quantity: it.quantity, unit_price: it.price })),
+      total,
+      address,
+    });
+
+    const { rows: shopRows } = await pool.query(`
+      SELECT s.id AS shop_id, s.shop_name, s.email AS shop_email,
+             oi.product_name, oi.quantity, oi.unit_price
+      FROM order_items oi
+      JOIN products p ON p.id = oi.product_id
+      JOIN shops s ON s.id = p.shop_id
+      WHERE oi.order_id = $1
+    `, [orderId]);
+
+    const byShop = new Map();
+    for (const row of shopRows) {
+      if (!byShop.has(row.shop_id)) {
+        byShop.set(row.shop_id, { shopEmail: row.shop_email, shopName: row.shop_name, items: [], subtotal: 0 });
+      }
+      const entry = byShop.get(row.shop_id);
+      entry.items.push({ product_name: row.product_name, quantity: row.quantity, unit_price: row.unit_price });
+      entry.subtotal += row.unit_price * row.quantity;
+    }
+
+    for (const { shopEmail, shopName, items: shopItems, subtotal } of byShop.values()) {
+      sendShopNewOrderEmail({
+        shopEmail, shopName, orderId, items: shopItems, subtotal,
+        customerName: req.customer.name, address,
+      });
+    }
   }
 });
 

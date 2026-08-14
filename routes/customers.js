@@ -10,6 +10,7 @@ const bcrypt = require('bcryptjs');
 const router = express.Router();
 const { pool } = require('../database');
 const { requireCustomerAuth, signCustomerToken } = require('../middleware/auth');
+const { sendCustomerWelcomeEmail } = require('../utils/email');
 
 function toCustomerPayload(customer) {
   return {
@@ -49,8 +50,11 @@ router.post('/register', async (req, res) => {
 
   const customer = rows[0];
   const token = signCustomerToken(customer);
+  const payload = toCustomerPayload(customer);
 
-  res.status(201).json({ token, customer: toCustomerPayload(customer) });
+  sendCustomerWelcomeEmail(payload); // en tâche de fond, ne bloque pas la réponse
+
+  res.status(201).json({ token, customer: payload });
 });
 
 // -----------------------------------------------------------------------
